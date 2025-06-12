@@ -8,6 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.utilities import rank_zero_info
+from rtd_lite_regularizer import RTDLiteRegularizer
 
 from co_datasets.tsp_graph_dataset import TSPGraphDataset
 from pl_meta_model import COMetaModel
@@ -34,6 +36,11 @@ class TSPModel(COMetaModel):
         data_file=os.path.join(self.args.storage_path, self.args.validation_split),
         sparse_factor=self.args.sparse_factor,
     )
+    self.topo_reg = RTDLiteRegularizer(
+      big_mult=10.0,
+      max_coef=0.15,
+      warmup_steps=10000,
+    )
 
   def forward(self, x, adj, t, edge_index):
     return self.model(x, t, adj, edge_index)
@@ -41,10 +48,12 @@ class TSPModel(COMetaModel):
   def categorical_training_step(self, batch, batch_idx):
     edge_index = None
     if not self.sparse:
-      _, points, adj_matrix, _ = batch
+      # gt_tour is the ground 
+      _, points, adj_matrix, gt_tour, dist = batch
       t = np.random.randint(1, self.diffusion.T + 1, points.shape[0]).astype(int)
+      dist = dist.to(points.device)
     else:
-      _, graph_data, point_indicator, edge_indicator, _ = batch
+      _, graph_data, point_indicator, edge_indicator, gt_tour = batch
       t = np.random.randint(1, self.diffusion.T + 1, point_indicator.shape[0]).astype(int)
       route_edge_flags = graph_data.edge_attr
       points = graph_data.x
@@ -83,14 +92,34 @@ class TSPModel(COMetaModel):
     # Compute loss
     loss_func = nn.CrossEntropyLoss()
     loss = loss_func(x0_pred, adj_matrix.long())
-    self.log("train/loss", loss)
+
+    self.log("train/diff_loss", loss)
+    if not self.sparse : 
+      pts = points.float().to(adj_matrix.device)
+
+      # extract ground-truth tour edges from your batch’s gt_tour
+      # here we assume gt_tour is a list of node indices per graph
+      tour_edges=[]
+      for b in range(gt_tour.size(0)):
+        seq = gt_tour[b].tolist()    # e.g. [v0, v1, …, v(N-1)]
+        edges = [(seq[i], seq[i+1]) for i in range(len(seq)-1)]
+        edges.append((seq[-1], seq[0]))  # close the cycle
+        tour_edges.append(edges)
+
+      # compute RTD-Lite term
+      reg = self.topo_reg(x0_pred, tour_edges, dist)
+      self.log("train/rtd_lite", reg, on_step=True, prog_bar=False)
+
+      loss = loss + reg
+      self.log("train/total_loss", loss)
+
     return loss
 
   def gaussian_training_step(self, batch, batch_idx):
     if self.sparse:
       # TODO: Implement Gaussian diffusion with sparse graphs
       raise ValueError("DIFUSCO with sparse graphs are not supported for Gaussian diffusion")
-    _, points, adj_matrix, _ = batch
+    _, points, adj_matrix, _, _ = batch
 
     adj_matrix = adj_matrix * 2 - 1
     adj_matrix = adj_matrix * (1.0 + 0.05 * torch.rand_like(adj_matrix))
@@ -155,7 +184,7 @@ class TSPModel(COMetaModel):
     np_edge_index = None
     device = batch[-1].device
     if not self.sparse:
-      real_batch_idx, points, adj_matrix, gt_tour = batch
+      real_batch_idx, points, adj_matrix, gt_tour, _ = batch
       np_points = points.cpu().numpy()[0]
       np_gt_tour = gt_tour.cpu().numpy()[0]
     else:

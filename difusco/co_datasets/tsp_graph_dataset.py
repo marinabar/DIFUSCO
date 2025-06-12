@@ -12,7 +12,20 @@ class TSPGraphDataset(torch.utils.data.Dataset):
     self.data_file = data_file
     self.sparse_factor = sparse_factor
     self.file_lines = open(data_file).read().splitlines()
+    self.tours_list = []
+    self.points_list = []
+    self.dists = []
     print(f'Loaded "{data_file}" with {len(self.file_lines)} lines')
+    for idx in range(len(self.file_lines)):
+      pts_np, tour_np = self.get_example(idx)
+      pts = torch.from_numpy(pts_np).float()
+      tour = torch.from_numpy(tour_np).long()
+      self.points_list.append(pts)
+      self.tours_list.append(tour)
+      self.dists.append(torch.cdist(pts, pts, p=2))
+
+    print(f'Added "{len(self.points_list)}" entries into the table of points, tours and distances')
+ 
 
   def __len__(self):
     return len(self.file_lines)
@@ -37,6 +50,10 @@ class TSPGraphDataset(torch.utils.data.Dataset):
 
   def __getitem__(self, idx):
     points, tour = self.get_example(idx)
+    points = self.points_list[idx]
+    tour   = self.tours_list[idx]
+    dist   = self.dists[idx]
+
     if self.sparse_factor <= 0:
       # Return a densely connected graph
       adj_matrix = np.zeros((points.shape[0], points.shape[0]))
@@ -45,9 +62,10 @@ class TSPGraphDataset(torch.utils.data.Dataset):
       # return points, adj_matrix, tour
       return (
           torch.LongTensor(np.array([idx], dtype=np.int64)),
-          torch.from_numpy(points).float(),
+          points,
           torch.from_numpy(adj_matrix).float(),
-          torch.from_numpy(tour).long(),
+          tour,
+          dist
       )
     else:
       # Return a sparse graph where each node is connected to its k nearest neighbors
